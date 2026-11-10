@@ -37,6 +37,23 @@ PESO_ESTRUCTURAL = 0.15
 PESO_FORECAST_ESTACIONAL = 0.85
 UMBRAL_ESTACIONAL = 1.20
 
+# Factores selectivos moderados derivados del sesgo por categoría observado
+# en el backtest Nov-Dic 2025 sin combos. No se aplica el sesgo completo para
+# reducir riesgo de sobreajuste.
+CALIBRACION_CATEGORIAS = {
+    "LACTEOS CULINARIOS": 1.08,
+    "CHOCOLATE MESA": 1.08,
+    "NESTLE PROFESSIONAL": 1.08,
+    "RTD": 1.05,
+    "CHOCOLATE IMPULSO": 0.92,
+    "CARNATION POLVO": 0.90,
+    "CEREALES": 0.97,
+    "AGUAS": 0.97,
+}
+FACTOR_CALIBRACION_MIN = 0.90
+FACTOR_CALIBRACION_MAX = 1.10
+APLICAR_CALIBRACION_A_COMBOS = False
+
 
 def normalizar_codigo(serie):
     return serie.astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
@@ -561,6 +578,29 @@ def aplicar_ajuste_estacional(pred_base, historial, periodo):
     return max(0.0, float(prediccion_final)), diagnostico
 
 
+def normalizar_categoria_calibracion(categoria):
+    import unicodedata
+    texto = unicodedata.normalize("NFKD", str(categoria))
+    texto = "".join(c for c in texto if not unicodedata.combining(c))
+    return " ".join(texto.upper().strip().split())
+
+
+def aplicar_calibracion_selectiva(prediccion, categoria, es_combo=0):
+    """Devuelve predicción calibrada, factor, indicador y motivo."""
+    prediccion = max(0.0, float(prediccion))
+    categoria_norm = normalizar_categoria_calibracion(categoria)
+    if int(es_combo) == 1 and not APLICAR_CALIBRACION_A_COMBOS:
+        return prediccion, 1.0, False, "Combo sin calibración"
+    factor = float(np.clip(
+        CALIBRACION_CATEGORIAS.get(categoria_norm, 1.0),
+        FACTOR_CALIBRACION_MIN,
+        FACTOR_CALIBRACION_MAX,
+    ))
+    aplicada = not np.isclose(factor, 1.0)
+    motivo = f"Factor selectivo de {categoria_norm}" if aplicada else "Sin corrección selectiva"
+    return prediccion * factor, factor, aplicada, motivo
+
+
 def calcular_metricas(y_real, y_pred):
     y_real = np.asarray(y_real, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
@@ -582,7 +622,7 @@ def calcular_metricas(y_real, y_pred):
 
 
 @st.cache_data(show_spinner=False)
-def backtest_suavizado_nov_dic_2025(df, version="piso-parcial-mensual-backtest-v3"):
+def backtest_suavizado_nov_dic_2025(df, version="comparacion-calibracion-categoria-v1"):
     """Entrena hasta octubre 2025 y predice Nov-Dic 2025 con la regla suavizada."""
     train = df[df["Periodo"] < 202511].copy()
     real = df[df["Periodo"].isin([202511, 202512])].copy()
@@ -609,7 +649,14 @@ def backtest_suavizado_nov_dic_2025(df, version="piso-parcial-mensual-backtest-v
         ):
             estructural = float(unid) * float(precio_prom)
             base = PESO_VENTA_DIRECTA * float(vd) + PESO_ESTRUCTURAL * estructural
-            pred_final, diag = aplicar_ajuste_estacional(base, hist, int(rr["Periodo"]))
+            pred_sin_calibrar, diag = aplicar_ajuste_estacional(base, hist, int(rr["Periodo"]))
+            pred_calibrada, factor_categoria, calibracion_aplicada, motivo_calibracion = (
+                aplicar_calibracion_selectiva(
+                    pred_sin_calibrar,
+                    rr.get("CATEGORIA", "SIN_DATO"),
+                    rr.get("COMBOS", 0),
+                )
+            )
             filas.append({
                 "CODIGO": codigo,
                 "DESCRIPCION": rr.get("DESCRIPCION", ""),
@@ -627,9 +674,61 @@ def backtest_suavizado_nov_dic_2025(df, version="piso-parcial-mensual-backtest-v
                 "Porcentaje_recuperacion": diag["Porcentaje_recuperacion"],
                 "Correccion_piso": diag["Correccion_piso"],
                 "Ajuste_aplicado": diag["Ajuste_aplicado"],
-                "Prediccion_final": float(pred_final),
+                "Prediccion_sin_calibracion": float(pred_sin_calibrar),
+                "Factor_calibracion_categoria": float(factor_categoria),
+                "Calibracion_categoria_aplicada": bool(calibracion_aplicada),
+                "Motivo_calibracion": motivo_calibracion,
+                "Prediccion_calibrada": float(pred_calibrada),
+                # Se conserva este nombre para compatibilidad con las tablas existentes.
+                "Prediccion_final": float(pred_sin_calibrar),
             })
     return pd.DataFrame(filas)
+
+
+def comparar_modelos_calibracion(detalle):
+    modelos = [
+        ("Sin calibración por categoría", "Prediccion_sin_calibracion"),
+        ("Con calibración selectiva", "Prediccion_calibrada"),
+    ]
+    filas = []
+    for nombre, columna in modelos:
+        m = calcular_metricas(detalle["Actual"], detalle[columna])
+        filas.append({"Modelo": nombre, **m})
+    comparacion = pd.DataFrame(filas)
+    base = comparacion.iloc[0]
+    calibrado = comparacion.iloc[1]
+    mejora = pd.DataFrame([{
+        "Cambio_WAPE_pp": calibrado["WAPE"] - base["WAPE"],
+        "Cambio_MAE": calibrado["MAE"] - base["MAE"],
+        "Cambio_RMSE": calibrado["RMSE"] - base["RMSE"],
+        "Cambio_R2": calibrado["R2"] - base["R2"],
+        "Cambio_Sesgo_pp": calibrado["SESGO"] - base["SESGO"],
+    }])
+    return comparacion, mejora
+
+
+def metricas_por_categoria_comparadas(detalle):
+    filas = []
+    for categoria, grupo in detalle.groupby("CATEGORIA", dropna=False):
+        base = calcular_metricas(grupo["Actual"], grupo["Prediccion_sin_calibracion"])
+        cal = calcular_metricas(grupo["Actual"], grupo["Prediccion_calibrada"])
+        filas.append({
+            "CATEGORIA": str(categoria),
+            "SKU": grupo["CODIGO"].nunique(),
+            "FACTOR": grupo["Factor_calibracion_categoria"].max(),
+            "WAPE_SIN": base["WAPE"],
+            "WAPE_CAL": cal["WAPE"],
+            "DELTA_WAPE": cal["WAPE"] - base["WAPE"],
+            "RMSE_SIN": base["RMSE"],
+            "RMSE_CAL": cal["RMSE"],
+            "DELTA_RMSE": cal["RMSE"] - base["RMSE"],
+            "SESGO_SIN": base["SESGO"],
+            "SESGO_CAL": cal["SESGO"],
+            "VENTA_REAL": base["REAL"],
+            "PRED_SIN": base["PRED"],
+            "PRED_CAL": cal["PRED"],
+        })
+    return pd.DataFrame(filas).sort_values("VENTA_REAL", ascending=False)
 
 
 def tabla_metricas_por_mes(detalle):
@@ -795,14 +894,25 @@ if archivos:
             )
             st.stop()
 
-        st.markdown("### Validación del piso parcial diferenciado por mes")
+        st.markdown("### Validación del piso parcial y calibración por categoría")
+        with st.expander("Factores selectivos evaluados", expanded=False):
+            tabla_factores = pd.DataFrame([
+                {"CATEGORIA": k, "FACTOR": v, "CAMBIO_PCT": (v - 1) * 100}
+                for k, v in CALIBRACION_CATEGORIAS.items()
+            ]).sort_values("CATEGORIA")
+            st.dataframe(
+                tabla_factores.style.format({"FACTOR": "{:.2f}", "CAMBIO_PCT": "{:+.1f}%"}),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.caption("La comparación usa el mismo backtest Nov-Dic 2025 y los mismos SKU sin combos.")
         col_limpiar, col_version = st.columns([1, 2])
         with col_limpiar:
             if st.button("Limpiar resultados anteriores", type="secondary"):
                 for clave in [
                     "detalle_backtest_suavizado",
                     "detalle_backtest_piso_mensual_v2",
-                    "detalle_backtest_piso_mensual_v3",
+                    "detalle_backtest_calibracion_categoria_v1",
                     "forecast_2026",
                 ]:
                     st.session_state.pop(clave, None)
@@ -815,19 +925,19 @@ if archivos:
         excluir_combos_bt = st.checkbox(
             "Excluir combos del backtest", value=True, key="excluir_combos_backtest"
         )
-        if st.button("Calcular métricas 45%/60% Nov-Dic 2025", type="primary"):
+        if st.button("Comparar métricas con y sin calibración", type="primary"):
             progreso_bt = st.progress(0, text="Entrenando únicamente hasta octubre de 2025...")
             try:
                 detalle_bt = backtest_suavizado_nov_dic_2025(df)
-                st.session_state["detalle_backtest_piso_mensual_v3"] = detalle_bt
+                st.session_state["detalle_backtest_calibracion_categoria_v1"] = detalle_bt
                 progreso_bt.progress(1.0, text="Backtest completado")
                 st.rerun()
             except Exception as error_bt:
                 progreso_bt.empty()
                 st.exception(error_bt)
 
-        if "detalle_backtest_piso_mensual_v3" in st.session_state:
-            detalle_bt = st.session_state["detalle_backtest_piso_mensual_v3"].copy()
+        if "detalle_backtest_calibracion_categoria_v1" in st.session_state:
+            detalle_bt = st.session_state["detalle_backtest_calibracion_categoria_v1"].copy()
             evaluado_bt = (
                 detalle_bt[detalle_bt["COMBOS"] == 0].copy()
                 if excluir_combos_bt else detalle_bt.copy()
@@ -867,8 +977,10 @@ if archivos:
                     )
                     st.stop()
 
+                # Comparación honesta sobre exactamente los mismos SKU y meses.
+                comparacion_modelos, mejora_calibracion = comparar_modelos_calibracion(evaluado_bt)
                 metricas_bt = calcular_metricas(
-                    evaluado_bt["Actual"], evaluado_bt["Prediccion_final"]
+                    evaluado_bt["Actual"], evaluado_bt["Prediccion_sin_calibracion"]
                 )
                 m1, m2, m3, m4, m5 = st.columns(5)
                 m1.metric("WAPE", f"{metricas_bt['WAPE']:.2f}%")
@@ -880,6 +992,55 @@ if archivos:
                     f"Venta real: ${metricas_bt['REAL']:,.2f} | "
                     f"Pronóstico con piso mensual: ${metricas_bt['PRED']:,.2f} | "
                     f"{evaluado_bt['CODIGO'].nunique():,} SKU"
+                )
+
+                st.markdown("#### Comparación: antes vs calibración selectiva")
+                formato_comparacion = {
+                    "WAPE": "{:.2f}%", "MAE": "${:,.2f}",
+                    "RMSE": "${:,.2f}", "R2": "{:.4f}",
+                    "SESGO": "{:+.2f}%", "REAL": "${:,.2f}",
+                    "PRED": "${:,.2f}",
+                }
+                st.dataframe(
+                    comparacion_modelos.style.format(formato_comparacion),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                delta = mejora_calibracion.iloc[0]
+                d1, d2, d3, d4, d5 = st.columns(5)
+                d1.metric("Δ WAPE", f"{delta['Cambio_WAPE_pp']:+.2f} pp")
+                d2.metric("Δ MAE", f"${delta['Cambio_MAE']:+,.2f}")
+                d3.metric("Δ RMSE", f"${delta['Cambio_RMSE']:+,.2f}")
+                d4.metric("Δ R²", f"{delta['Cambio_R2']:+.4f}")
+                d5.metric("Δ Sesgo", f"{delta['Cambio_Sesgo_pp']:+.2f} pp")
+                if delta["Cambio_WAPE_pp"] < 0 and delta["Cambio_RMSE"] <= 0:
+                    st.success("La calibración selectiva mejora WAPE y no empeora RMSE.")
+                elif delta["Cambio_WAPE_pp"] < 0:
+                    st.warning("La calibración mejora WAPE, pero aumenta RMSE. Revisa categorías y SKU extremos.")
+                else:
+                    st.error("La calibración selectiva no mejora el WAPE global. No se recomienda activarla como versión final.")
+
+                por_categoria_comparado = metricas_por_categoria_comparadas(evaluado_bt)
+                st.markdown("#### Efecto por categoría")
+                st.dataframe(
+                    por_categoria_comparado.style.format({
+                        "FACTOR": "{:.2f}",
+                        "WAPE_SIN": "{:.2f}%", "WAPE_CAL": "{:.2f}%",
+                        "DELTA_WAPE": "{:+.2f} pp",
+                        "RMSE_SIN": "${:,.2f}", "RMSE_CAL": "${:,.2f}",
+                        "DELTA_RMSE": "${:+,.2f}",
+                        "SESGO_SIN": "{:+.2f}%", "SESGO_CAL": "{:+.2f}%",
+                        "VENTA_REAL": "${:,.2f}", "PRED_SIN": "${:,.2f}",
+                        "PRED_CAL": "${:,.2f}",
+                    }),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                st.download_button(
+                    "Descargar comparación de calibración",
+                    por_categoria_comparado.to_csv(index=False).encode("utf-8-sig"),
+                    "comparacion_calibracion_selectiva_categoria.csv",
+                    "text/csv",
                 )
 
                 tab_mes, tab_categoria, tab_detalle = st.tabs([
@@ -1097,3 +1258,4 @@ if archivos:
         st.exception(error)
 else:
     st.info("Carga los tres archivos Excel para comenzar.")
+
