@@ -41,12 +41,15 @@ UMBRAL_ESTACIONAL = 1.20
 # en el backtest Nov-Dic 2025 sin combos. No se aplica el sesgo completo para
 # reducir riesgo de sobreajuste.
 CALIBRACION_CATEGORIAS = {
-    "LACTEOS CULINARIOS": 1.08,
-    "CHOCOLATE MESA": 1.08,
-    "NESTLE PROFESSIONAL": 1.08,
-    "RTD": 1.05,
-    "CHOCOLATE IMPULSO": 0.92,
-    "CARNATION POLVO": 0.90,
+    # Categorías subestimadas: corrección moderadamente mayor.
+    "LACTEOS CULINARIOS": 1.10,
+    "CHOCOLATE MESA": 1.10,
+    "NESTLE PROFESSIONAL": 1.10,
+    "RTD": 1.08,
+
+    # Categorías sobreestimadas: corrección moderadamente menor.
+    "CHOCOLATE IMPULSO": 0.90,
+    "CARNATION POLVO": 0.92,
     "CEREALES": 0.97,
     "AGUAS": 0.97,
 }
@@ -622,7 +625,7 @@ def calcular_metricas(y_real, y_pred):
 
 
 @st.cache_data(show_spinner=False)
-def backtest_suavizado_nov_dic_2025(df, version="comparacion-calibracion-categoria-v1"):
+def backtest_suavizado_nov_dic_2025(df, version="comparacion-calibracion-categoria-v2"):
     """Entrena hasta octubre 2025 y predice Nov-Dic 2025 con la regla suavizada."""
     train = df[df["Periodo"] < 202511].copy()
     real = df[df["Periodo"].isin([202511, 202512])].copy()
@@ -688,7 +691,7 @@ def backtest_suavizado_nov_dic_2025(df, version="comparacion-calibracion-categor
 def comparar_modelos_calibracion(detalle):
     modelos = [
         ("Sin calibración por categoría", "Prediccion_sin_calibracion"),
-        ("Con calibración selectiva", "Prediccion_calibrada"),
+        ("Con calibración selectiva V2", "Prediccion_calibrada"),
     ]
     filas = []
     for nombre, columna in modelos:
@@ -895,7 +898,7 @@ if archivos:
             st.stop()
 
         st.markdown("### Validación del piso parcial y calibración por categoría")
-        with st.expander("Factores selectivos evaluados", expanded=False):
+        with st.expander("Factores selectivos V2 evaluados", expanded=False):
             tabla_factores = pd.DataFrame([
                 {"CATEGORIA": k, "FACTOR": v, "CAMBIO_PCT": (v - 1) * 100}
                 for k, v in CALIBRACION_CATEGORIAS.items()
@@ -905,7 +908,11 @@ if archivos:
                 use_container_width=True,
                 hide_index=True,
             )
-            st.caption("La comparación usa el mismo backtest Nov-Dic 2025 y los mismos SKU sin combos.")
+            st.caption(
+                "Versión V2: Lácteos Culinarios, Chocolate Mesa y Nestlé Professional 1.10; "
+                "RTD 1.08; Chocolate Impulso 0.90; Carnation Polvo 0.92; "
+                "Cereales y Aguas 0.97. La comparación usa el mismo backtest Nov-Dic 2025."
+            )
         col_limpiar, col_version = st.columns([1, 2])
         with col_limpiar:
             if st.button("Limpiar resultados anteriores", type="secondary"):
@@ -913,6 +920,7 @@ if archivos:
                     "detalle_backtest_suavizado",
                     "detalle_backtest_piso_mensual_v2",
                     "detalle_backtest_calibracion_categoria_v1",
+                    "detalle_backtest_calibracion_categoria_v2",
                     "forecast_2026",
                 ]:
                     st.session_state.pop(clave, None)
@@ -925,19 +933,19 @@ if archivos:
         excluir_combos_bt = st.checkbox(
             "Excluir combos del backtest", value=True, key="excluir_combos_backtest"
         )
-        if st.button("Comparar métricas con y sin calibración", type="primary"):
+        if st.button("Comparar métricas: sin calibración vs calibración V2", type="primary"):
             progreso_bt = st.progress(0, text="Entrenando únicamente hasta octubre de 2025...")
             try:
                 detalle_bt = backtest_suavizado_nov_dic_2025(df)
-                st.session_state["detalle_backtest_calibracion_categoria_v1"] = detalle_bt
+                st.session_state["detalle_backtest_calibracion_categoria_v2"] = detalle_bt
                 progreso_bt.progress(1.0, text="Backtest completado")
                 st.rerun()
             except Exception as error_bt:
                 progreso_bt.empty()
                 st.exception(error_bt)
 
-        if "detalle_backtest_calibracion_categoria_v1" in st.session_state:
-            detalle_bt = st.session_state["detalle_backtest_calibracion_categoria_v1"].copy()
+        if "detalle_backtest_calibracion_categoria_v2" in st.session_state:
+            detalle_bt = st.session_state["detalle_backtest_calibracion_categoria_v2"].copy()
             evaluado_bt = (
                 detalle_bt[detalle_bt["COMBOS"] == 0].copy()
                 if excluir_combos_bt else detalle_bt.copy()
@@ -1014,11 +1022,11 @@ if archivos:
                 d4.metric("Δ R²", f"{delta['Cambio_R2']:+.4f}")
                 d5.metric("Δ Sesgo", f"{delta['Cambio_Sesgo_pp']:+.2f} pp")
                 if delta["Cambio_WAPE_pp"] < 0 and delta["Cambio_RMSE"] <= 0:
-                    st.success("La calibración selectiva mejora WAPE y no empeora RMSE.")
+                    st.success("La calibración V2 mejora WAPE y no empeora RMSE.")
                 elif delta["Cambio_WAPE_pp"] < 0:
                     st.warning("La calibración mejora WAPE, pero aumenta RMSE. Revisa categorías y SKU extremos.")
                 else:
-                    st.error("La calibración selectiva no mejora el WAPE global. No se recomienda activarla como versión final.")
+                    st.error("La calibración V2 no mejora el WAPE global. No se recomienda activarla como versión final.")
 
                 por_categoria_comparado = metricas_por_categoria_comparadas(evaluado_bt)
                 st.markdown("#### Efecto por categoría")
@@ -1039,7 +1047,7 @@ if archivos:
                 st.download_button(
                     "Descargar comparación de calibración",
                     por_categoria_comparado.to_csv(index=False).encode("utf-8-sig"),
-                    "comparacion_calibracion_selectiva_categoria.csv",
+                    "comparacion_calibracion_selectiva_categoria_V2.csv",
                     "text/csv",
                 )
 
@@ -1258,4 +1266,3 @@ if archivos:
         st.exception(error)
 else:
     st.info("Carga los tres archivos Excel para comenzar.")
-
