@@ -41,15 +41,12 @@ UMBRAL_ESTACIONAL = 1.20
 # en el backtest Nov-Dic 2025 sin combos. No se aplica el sesgo completo para
 # reducir riesgo de sobreajuste.
 CALIBRACION_CATEGORIAS = {
-    # Categorías subestimadas: corrección moderadamente mayor.
-    "LACTEOS CULINARIOS": 1.10,
-    "CHOCOLATE MESA": 1.10,
-    "NESTLE PROFESSIONAL": 1.10,
-    "RTD": 1.08,
-
-    # Categorías sobreestimadas: corrección moderadamente menor.
-    "CHOCOLATE IMPULSO": 0.90,
-    "CARNATION POLVO": 0.92,
+    "LACTEOS CULINARIOS": 1.08,
+    "CHOCOLATE MESA": 1.08,
+    "NESTLE PROFESSIONAL": 1.08,
+    "RTD": 1.05,
+    "CHOCOLATE IMPULSO": 0.92,
+    "CARNATION POLVO": 0.90,
     "CEREALES": 0.97,
     "AGUAS": 0.97,
 }
@@ -625,7 +622,7 @@ def calcular_metricas(y_real, y_pred):
 
 
 @st.cache_data(show_spinner=False)
-def backtest_suavizado_nov_dic_2025(df, version="comparacion-calibracion-categoria-v2"):
+def backtest_suavizado_nov_dic_2025(df, version="metricas-segmentadas-combos-v1"):
     """Entrena hasta octubre 2025 y predice Nov-Dic 2025 con la regla suavizada."""
     train = df[df["Periodo"] < 202511].copy()
     real = df[df["Periodo"].isin([202511, 202512])].copy()
@@ -691,7 +688,7 @@ def backtest_suavizado_nov_dic_2025(df, version="comparacion-calibracion-categor
 def comparar_modelos_calibracion(detalle):
     modelos = [
         ("Sin calibración por categoría", "Prediccion_sin_calibracion"),
-        ("Con calibración selectiva V2", "Prediccion_calibrada"),
+        ("Con calibración selectiva", "Prediccion_calibrada"),
     ]
     filas = []
     for nombre, columna in modelos:
@@ -897,8 +894,8 @@ if archivos:
             )
             st.stop()
 
-        st.markdown("### Validación del piso parcial y calibración por categoría")
-        with st.expander("Factores selectivos V2 evaluados", expanded=False):
+        st.markdown("### Métricas segmentadas: todos, sin combos o solo combos")
+        with st.expander("Factores selectivos evaluados", expanded=False):
             tabla_factores = pd.DataFrame([
                 {"CATEGORIA": k, "FACTOR": v, "CAMBIO_PCT": (v - 1) * 100}
                 for k, v in CALIBRACION_CATEGORIAS.items()
@@ -908,19 +905,14 @@ if archivos:
                 use_container_width=True,
                 hide_index=True,
             )
-            st.caption(
-                "Versión V2: Lácteos Culinarios, Chocolate Mesa y Nestlé Professional 1.10; "
-                "RTD 1.08; Chocolate Impulso 0.90; Carnation Polvo 0.92; "
-                "Cereales y Aguas 0.97. La comparación usa el mismo backtest Nov-Dic 2025."
-            )
+            st.caption("La comparación usa el mismo backtest Nov-Dic 2025 y los mismos SKU sin combos.")
         col_limpiar, col_version = st.columns([1, 2])
         with col_limpiar:
             if st.button("Limpiar resultados anteriores", type="secondary"):
                 for clave in [
                     "detalle_backtest_suavizado",
                     "detalle_backtest_piso_mensual_v2",
-                    "detalle_backtest_calibracion_categoria_v1",
-                    "detalle_backtest_calibracion_categoria_v2",
+                    "detalle_backtest_metricas_segmentadas_combos_v1",
                     "forecast_2026",
                 ]:
                     st.session_state.pop(clave, None)
@@ -930,29 +922,49 @@ if archivos:
                 st.rerun()
         with col_version:
             st.info("Configuración activa: noviembre 45% | diciembre 60% | versión v3")
-        excluir_combos_bt = st.checkbox(
-            "Excluir combos del backtest", value=True, key="excluir_combos_backtest"
+        segmento_backtest = st.segmented_control(
+            "Población para calcular las métricas",
+            options=["TODOS", "SIN COMBOS", "SOLO COMBOS"],
+            default="SOLO COMBOS",
+            key="segmento_backtest",
+            help=(
+                "SOLO COMBOS excluye completamente los productos regulares. "
+                "Las métricas se calculan únicamente con registros COMBOS = 1."
+            ),
         )
-        if st.button("Comparar métricas: sin calibración vs calibración V2", type="primary"):
+        if segmento_backtest is None:
+            segmento_backtest = "SOLO COMBOS"
+        if st.button("Calcular métricas del segmento seleccionado", type="primary"):
             progreso_bt = st.progress(0, text="Entrenando únicamente hasta octubre de 2025...")
             try:
                 detalle_bt = backtest_suavizado_nov_dic_2025(df)
-                st.session_state["detalle_backtest_calibracion_categoria_v2"] = detalle_bt
+                st.session_state["detalle_backtest_metricas_segmentadas_combos_v1"] = detalle_bt
                 progreso_bt.progress(1.0, text="Backtest completado")
                 st.rerun()
             except Exception as error_bt:
                 progreso_bt.empty()
                 st.exception(error_bt)
 
-        if "detalle_backtest_calibracion_categoria_v2" in st.session_state:
-            detalle_bt = st.session_state["detalle_backtest_calibracion_categoria_v2"].copy()
-            evaluado_bt = (
-                detalle_bt[detalle_bt["COMBOS"] == 0].copy()
-                if excluir_combos_bt else detalle_bt.copy()
-            )
+        if "detalle_backtest_metricas_segmentadas_combos_v1" in st.session_state:
+            detalle_bt = st.session_state["detalle_backtest_metricas_segmentadas_combos_v1"].copy()
+            if segmento_backtest == "SOLO COMBOS":
+                evaluado_bt = detalle_bt[detalle_bt["COMBOS"] == 1].copy()
+            elif segmento_backtest == "SIN COMBOS":
+                evaluado_bt = detalle_bt[detalle_bt["COMBOS"] == 0].copy()
+            else:
+                evaluado_bt = detalle_bt.copy()
             if evaluado_bt.empty:
                 st.warning("No quedaron registros para evaluar con el filtro seleccionado.")
             else:
+                combos_evaluados = int((evaluado_bt["COMBOS"] == 1).sum())
+                regulares_evaluados = int((evaluado_bt["COMBOS"] == 0).sum())
+                st.info(
+                    f"Segmento activo: {segmento_backtest} | "
+                    f"{evaluado_bt['CODIGO'].nunique():,} SKU | "
+                    f"{len(evaluado_bt):,} registros SKU-mes | "
+                    f"registros combo: {combos_evaluados:,} | "
+                    f"registros regulares: {regulares_evaluados:,}"
+                )
                 comprobacion = (
                     evaluado_bt.groupby("Periodo", as_index=False)
                     .agg(
@@ -1003,6 +1015,12 @@ if archivos:
                 )
 
                 st.markdown("#### Comparación: antes vs calibración selectiva")
+                if segmento_backtest == "SOLO COMBOS":
+                    st.warning(
+                        "En la configuración actual los combos usan factor 1.00. "
+                        "Por eso las métricas con y sin calibración por categoría deben ser iguales. "
+                        "Esta vista sirve para medir el desempeño base de los combos antes de diseñar una calibración exclusiva."
+                    )
                 formato_comparacion = {
                     "WAPE": "{:.2f}%", "MAE": "${:,.2f}",
                     "RMSE": "${:,.2f}", "R2": "{:.4f}",
@@ -1022,11 +1040,11 @@ if archivos:
                 d4.metric("Δ R²", f"{delta['Cambio_R2']:+.4f}")
                 d5.metric("Δ Sesgo", f"{delta['Cambio_Sesgo_pp']:+.2f} pp")
                 if delta["Cambio_WAPE_pp"] < 0 and delta["Cambio_RMSE"] <= 0:
-                    st.success("La calibración V2 mejora WAPE y no empeora RMSE.")
+                    st.success("La calibración selectiva mejora WAPE y no empeora RMSE.")
                 elif delta["Cambio_WAPE_pp"] < 0:
                     st.warning("La calibración mejora WAPE, pero aumenta RMSE. Revisa categorías y SKU extremos.")
                 else:
-                    st.error("La calibración V2 no mejora el WAPE global. No se recomienda activarla como versión final.")
+                    st.error("La calibración selectiva no mejora el WAPE global. No se recomienda activarla como versión final.")
 
                 por_categoria_comparado = metricas_por_categoria_comparadas(evaluado_bt)
                 st.markdown("#### Efecto por categoría")
@@ -1047,9 +1065,69 @@ if archivos:
                 st.download_button(
                     "Descargar comparación de calibración",
                     por_categoria_comparado.to_csv(index=False).encode("utf-8-sig"),
-                    "comparacion_calibracion_selectiva_categoria_V2.csv",
+                    f"comparacion_{segmento_backtest.lower().replace(' ', '_')}.csv",
                     "text/csv",
                 )
+
+                if segmento_backtest == "SOLO COMBOS":
+                    st.markdown("#### Diagnóstico exclusivo de combos")
+                    combo_sku = evaluado_bt.copy()
+                    combo_sku["ERROR_ABS"] = (
+                        combo_sku["Actual"] - combo_sku["Prediccion_sin_calibracion"]
+                    ).abs()
+                    combo_sku["ERROR_NETO"] = (
+                        combo_sku["Prediccion_sin_calibracion"] - combo_sku["Actual"]
+                    )
+                    combo_sku["ERROR_PCT"] = np.where(
+                        combo_sku["Actual"].abs() > 0,
+                        100.0 * combo_sku["ERROR_NETO"] / combo_sku["Actual"],
+                        np.nan,
+                    )
+                    resumen_combo_sku = (
+                        combo_sku.groupby(
+                            ["CODIGO", "DESCRIPCION", "CATEGORIA"],
+                            as_index=False,
+                        )
+                        .agg(
+                            Venta_real=("Actual", "sum"),
+                            Pronostico=("Prediccion_sin_calibracion", "sum"),
+                            Error_absoluto=("ERROR_ABS", "sum"),
+                            Error_neto=("ERROR_NETO", "sum"),
+                        )
+                    )
+                    resumen_combo_sku["Sesgo_pct"] = np.where(
+                        resumen_combo_sku["Venta_real"].abs() > 0,
+                        100.0 * resumen_combo_sku["Error_neto"]
+                        / resumen_combo_sku["Venta_real"],
+                        np.nan,
+                    )
+                    error_total_combo = resumen_combo_sku["Error_absoluto"].sum()
+                    resumen_combo_sku["Contribucion_error_pct"] = np.where(
+                        error_total_combo > 0,
+                        100.0 * resumen_combo_sku["Error_absoluto"] / error_total_combo,
+                        0.0,
+                    )
+                    resumen_combo_sku = resumen_combo_sku.sort_values(
+                        "Error_absoluto", ascending=False
+                    )
+                    st.dataframe(
+                        resumen_combo_sku.style.format({
+                            "Venta_real": "${:,.2f}",
+                            "Pronostico": "${:,.2f}",
+                            "Error_absoluto": "${:,.2f}",
+                            "Error_neto": "${:+,.2f}",
+                            "Sesgo_pct": "{:+.2f}%",
+                            "Contribucion_error_pct": "{:.2f}%",
+                        }),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    st.download_button(
+                        "Descargar diagnóstico exclusivo de combos",
+                        resumen_combo_sku.to_csv(index=False).encode("utf-8-sig"),
+                        "diagnostico_metricas_solo_combos.csv",
+                        "text/csv",
+                    )
 
                 tab_mes, tab_categoria, tab_detalle = st.tabs([
                     "Por mes", "Por categoría", "Detalle SKU"
@@ -1077,7 +1155,7 @@ if archivos:
                     st.download_button(
                         "Descargar backtest suavizado CSV",
                         evaluado_bt.to_csv(index=False).encode("utf-8-sig"),
-                        "backtest_suavizado_nov_dic_2025.csv",
+                        f"backtest_{segmento_backtest.lower().replace(' ', '_')}_nov_dic_2025.csv",
                         "text/csv",
                     )
 
@@ -1266,3 +1344,4 @@ if archivos:
         st.exception(error)
 else:
     st.info("Carga los tres archivos Excel para comenzar.")
+
