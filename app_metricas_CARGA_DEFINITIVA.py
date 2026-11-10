@@ -54,32 +54,6 @@ FACTOR_CALIBRACION_MIN = 0.90
 FACTOR_CALIBRACION_MAX = 1.10
 APLICAR_CALIBRACION_A_COMBOS = False
 
-# Calibración EXCLUSIVA para combos. Estos factores son regularizados y se
-# evalúan contra el mismo backtest antes de adoptarlos en el forecast final.
-CALIBRACION_COMBOS_CATEGORIA = {
-    "LACTEOS CULINARIOS": 0.88,
-    "CEREALES": 1.35,
-    "CREMADORES": 1.02,
-    "CAFE SOLUBLE": 1.40,
-    "OTHER DAIRY": 1.01,
-    "CULINARIOS": 1.40,
-}
-
-# Correcciones puntuales para los combos con mayor contribución al error.
-# Se aplican antes del factor por categoría.
-CALIBRACION_COMBOS_SKU = {
-    "13802": 1.30,
-    "13467": 1.30,
-    "13134": 1.20,
-    "13229": 0.80,
-    "13123": 0.80,
-}
-
-FACTOR_COMBO_MIN = 0.75
-FACTOR_COMBO_MAX = 1.40
-RECUPERACION_COMBO_NOV = 0.20
-RECUPERACION_COMBO_DIC = 0.30
-
 
 def normalizar_codigo(serie):
     return serie.astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
@@ -627,47 +601,6 @@ def aplicar_calibracion_selectiva(prediccion, categoria, es_combo=0):
     return prediccion * factor, factor, aplicada, motivo
 
 
-def aplicar_calibracion_combo(prediccion, codigo, categoria, es_combo=0):
-    """Calibra únicamente combos con jerarquía SKU > categoría > 1.00."""
-    prediccion = max(0.0, float(prediccion))
-    if int(es_combo) != 1:
-        return prediccion, 1.0, False, "Producto regular sin calibración combo"
-
-    codigo_norm = str(codigo).replace(".0", "").strip()
-    categoria_norm = normalizar_categoria_calibracion(categoria)
-
-    if codigo_norm in CALIBRACION_COMBOS_SKU:
-        factor_original = CALIBRACION_COMBOS_SKU[codigo_norm]
-        nivel = "SKU"
-    elif categoria_norm in CALIBRACION_COMBOS_CATEGORIA:
-        factor_original = CALIBRACION_COMBOS_CATEGORIA[categoria_norm]
-        nivel = "CATEGORIA"
-    else:
-        factor_original = 1.0
-        nivel = "SIN_REGLA"
-
-    factor = float(np.clip(factor_original, FACTOR_COMBO_MIN, FACTOR_COMBO_MAX))
-    aplicada = not np.isclose(factor, 1.0)
-    motivo = (
-        f"Factor combo por {nivel}: {factor:.2f}"
-        if aplicada else "Combo sin corrección específica"
-    )
-    return max(0.0, prediccion * factor), factor, aplicada, motivo
-
-
-def aplicar_piso_combo_reducido(prediccion_combinada, piso_parcial, mes):
-    """Piso reducido para combos, separado del 45%/60% regular."""
-    recuperacion = (
-        RECUPERACION_COMBO_NOV if int(mes) == 11
-        else RECUPERACION_COMBO_DIC if int(mes) == 12
-        else 0.0
-    )
-    if pd.isna(piso_parcial) or prediccion_combinada >= piso_parcial:
-        return float(prediccion_combinada), 0.0, recuperacion
-    correccion = recuperacion * (float(piso_parcial) - float(prediccion_combinada))
-    return float(prediccion_combinada + correccion), float(correccion), recuperacion
-
-
 def calcular_metricas(y_real, y_pred):
     y_real = np.asarray(y_real, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
@@ -689,7 +622,7 @@ def calcular_metricas(y_real, y_pred):
 
 
 @st.cache_data(show_spinner=False)
-def backtest_suavizado_nov_dic_2025(df, version="metricas-calibracion-combos-v2"):
+def backtest_suavizado_nov_dic_2025(df, version="metricas-segmentadas-combos-v1"):
     """Entrena hasta octubre 2025 y predice Nov-Dic 2025 con la regla suavizada."""
     train = df[df["Periodo"] < 202511].copy()
     real = df[df["Periodo"].isin([202511, 202512])].copy()
@@ -717,36 +650,13 @@ def backtest_suavizado_nov_dic_2025(df, version="metricas-calibracion-combos-v2"
             estructural = float(unid) * float(precio_prom)
             base = PESO_VENTA_DIRECTA * float(vd) + PESO_ESTRUCTURAL * estructural
             pred_sin_calibrar, diag = aplicar_ajuste_estacional(base, hist, int(rr["Periodo"]))
-            es_combo = int(rr.get("COMBOS", 0))
-
-            if es_combo == 1:
-                # Sustituye únicamente el piso regular 45%/60% por 20%/30%.
-                pred_combo_piso, correccion_combo_piso, recuperacion_combo = (
-                    aplicar_piso_combo_reducido(
-                        diag["Prediccion_combinada"],
-                        diag["Piso_parcial"],
-                        int(rr["Periodo"]) % 100,
-                    )
+            pred_calibrada, factor_categoria, calibracion_aplicada, motivo_calibracion = (
+                aplicar_calibracion_selectiva(
+                    pred_sin_calibrar,
+                    rr.get("CATEGORIA", "SIN_DATO"),
+                    rr.get("COMBOS", 0),
                 )
-                pred_calibrada, factor_categoria, calibracion_aplicada, motivo_calibracion = (
-                    aplicar_calibracion_combo(
-                        pred_combo_piso,
-                        codigo,
-                        rr.get("CATEGORIA", "SIN_DATO"),
-                        es_combo,
-                    )
-                )
-            else:
-                pred_combo_piso = pred_sin_calibrar
-                correccion_combo_piso = diag["Correccion_piso"]
-                recuperacion_combo = diag["Porcentaje_recuperacion"]
-                pred_calibrada, factor_categoria, calibracion_aplicada, motivo_calibracion = (
-                    aplicar_calibracion_selectiva(
-                        pred_sin_calibrar,
-                        rr.get("CATEGORIA", "SIN_DATO"),
-                        es_combo,
-                    )
-                )
+            )
             filas.append({
                 "CODIGO": codigo,
                 "DESCRIPCION": rr.get("DESCRIPCION", ""),
@@ -764,24 +674,21 @@ def backtest_suavizado_nov_dic_2025(df, version="metricas-calibracion-combos-v2"
                 "Porcentaje_recuperacion": diag["Porcentaje_recuperacion"],
                 "Correccion_piso": diag["Correccion_piso"],
                 "Ajuste_aplicado": diag["Ajuste_aplicado"],
-                "Prediccion_piso_regular": float(pred_sin_calibrar),
-                "Prediccion_sin_calibracion": float(pred_combo_piso),
-                "Recuperacion_combo": float(recuperacion_combo),
-                "Correccion_piso_combo": float(correccion_combo_piso),
+                "Prediccion_sin_calibracion": float(pred_sin_calibrar),
                 "Factor_calibracion_categoria": float(factor_categoria),
                 "Calibracion_categoria_aplicada": bool(calibracion_aplicada),
                 "Motivo_calibracion": motivo_calibracion,
                 "Prediccion_calibrada": float(pred_calibrada),
-                # Predicción final del escenario calibrado.
-                "Prediccion_final": float(pred_calibrada),
+                # Se conserva este nombre para compatibilidad con las tablas existentes.
+                "Prediccion_final": float(pred_sin_calibrar),
             })
     return pd.DataFrame(filas)
 
 
 def comparar_modelos_calibracion(detalle):
     modelos = [
-        ("Combo con piso reducido, sin calibración", "Prediccion_sin_calibracion"),
-        ("Combo con piso reducido + calibración", "Prediccion_calibrada"),
+        ("Sin calibración por categoría", "Prediccion_sin_calibracion"),
+        ("Con calibración selectiva", "Prediccion_calibrada"),
     ]
     filas = []
     for nombre, columna in modelos:
@@ -987,34 +894,25 @@ if archivos:
             )
             st.stop()
 
-        st.markdown("### Calibración exclusiva para combos")
-        with st.expander("Ver configuración de combos", expanded=False):
-            tabla_combo_cat = pd.DataFrame([
-                {"TIPO": "CATEGORIA", "CLAVE": k, "FACTOR": v}
-                for k, v in CALIBRACION_COMBOS_CATEGORIA.items()
-            ])
-            tabla_combo_sku = pd.DataFrame([
-                {"TIPO": "SKU", "CLAVE": k, "FACTOR": v}
-                for k, v in CALIBRACION_COMBOS_SKU.items()
-            ])
-            tabla_combo = pd.concat([tabla_combo_sku, tabla_combo_cat], ignore_index=True)
+        st.markdown("### Métricas segmentadas: todos, sin combos o solo combos")
+        with st.expander("Factores selectivos evaluados", expanded=False):
+            tabla_factores = pd.DataFrame([
+                {"CATEGORIA": k, "FACTOR": v, "CAMBIO_PCT": (v - 1) * 100}
+                for k, v in CALIBRACION_CATEGORIAS.items()
+            ]).sort_values("CATEGORIA")
             st.dataframe(
-                tabla_combo.style.format({"FACTOR": "{:.2f}"}),
+                tabla_factores.style.format({"FACTOR": "{:.2f}", "CAMBIO_PCT": "{:+.1f}%"}),
                 use_container_width=True,
                 hide_index=True,
             )
-            st.caption(
-                "Jerarquía aplicada: factor por SKU, luego factor por categoría y finalmente 1.00. "
-                "Piso combo: 20% noviembre y 30% diciembre."
-            )
-
+            st.caption("La comparación usa el mismo backtest Nov-Dic 2025 y los mismos SKU sin combos.")
         col_limpiar, col_version = st.columns([1, 2])
         with col_limpiar:
             if st.button("Limpiar resultados anteriores", type="secondary"):
                 for clave in [
                     "detalle_backtest_suavizado",
                     "detalle_backtest_piso_mensual_v2",
-                    "detalle_backtest_calibracion_combos_v2",
+                    "detalle_backtest_metricas_segmentadas_combos_v1",
                     "forecast_2026",
                 ]:
                     st.session_state.pop(clave, None)
@@ -1023,7 +921,7 @@ if archivos:
                 st.success("Resultados anteriores y caché eliminados.")
                 st.rerun()
         with col_version:
-            st.info("Combos: piso 20% noviembre | 30% diciembre + calibración SKU/categoría")
+            st.info("Configuración activa: noviembre 45% | diciembre 60% | versión v3")
         segmento_backtest = st.segmented_control(
             "Población para calcular las métricas",
             options=["TODOS", "SIN COMBOS", "SOLO COMBOS"],
@@ -1036,19 +934,19 @@ if archivos:
         )
         if segmento_backtest is None:
             segmento_backtest = "SOLO COMBOS"
-        if st.button("Comparar combos antes y después de calibrar", type="primary"):
+        if st.button("Calcular métricas del segmento seleccionado", type="primary"):
             progreso_bt = st.progress(0, text="Entrenando únicamente hasta octubre de 2025...")
             try:
                 detalle_bt = backtest_suavizado_nov_dic_2025(df)
-                st.session_state["detalle_backtest_calibracion_combos_v2"] = detalle_bt
+                st.session_state["detalle_backtest_metricas_segmentadas_combos_v1"] = detalle_bt
                 progreso_bt.progress(1.0, text="Backtest completado")
                 st.rerun()
             except Exception as error_bt:
                 progreso_bt.empty()
                 st.exception(error_bt)
 
-        if "detalle_backtest_calibracion_combos_v2" in st.session_state:
-            detalle_bt = st.session_state["detalle_backtest_calibracion_combos_v2"].copy()
+        if "detalle_backtest_metricas_segmentadas_combos_v1" in st.session_state:
+            detalle_bt = st.session_state["detalle_backtest_metricas_segmentadas_combos_v1"].copy()
             if segmento_backtest == "SOLO COMBOS":
                 evaluado_bt = detalle_bt[detalle_bt["COMBOS"] == 1].copy()
             elif segmento_backtest == "SIN COMBOS":
@@ -1070,10 +968,9 @@ if archivos:
                 comprobacion = (
                     evaluado_bt.groupby("Periodo", as_index=False)
                     .agg(
-                        Recuperacion=("Recuperacion_combo", "max"),
-                        Correccion_total=("Correccion_piso_combo", "sum"),
-                        Prediccion_sin_calibrar=("Prediccion_sin_calibracion", "sum"),
-                        Prediccion_final=("Prediccion_calibrada", "sum"),
+                        Recuperacion=("Porcentaje_recuperacion", "max"),
+                        Correccion_total=("Correccion_piso", "sum"),
+                        Prediccion_final=("Prediccion_final", "sum"),
                     )
                 )
                 st.markdown("#### Comprobación de la configuración aplicada")
@@ -1081,23 +978,29 @@ if archivos:
                     comprobacion.style.format({
                         "Recuperacion": "{:.0%}",
                         "Correccion_total": "${:,.2f}",
-                        "Prediccion_sin_calibrar": "${:,.2f}",
                         "Prediccion_final": "${:,.2f}",
                     }),
                     use_container_width=True,
                     hide_index=True,
                 )
-                # En combos la recuperación se valida con las columnas
-                # Recuperacion_combo y Correccion_piso_combo.
+                recuperaciones = dict(zip(
+                    comprobacion["Periodo"].astype(int),
+                    comprobacion["Recuperacion"].astype(float),
+                ))
+                if not (
+                    abs(recuperaciones.get(202511, -1) - 0.45) < 1e-9
+                    and abs(recuperaciones.get(202512, -1) - 0.60) < 1e-9
+                ):
+                    st.error(
+                        "La configuración activa no corresponde a 45%/60%. "
+                        "Pulsa Limpiar resultados anteriores y vuelve a ejecutar."
+                    )
+                    st.stop()
+
                 # Comparación honesta sobre exactamente los mismos SKU y meses.
                 comparacion_modelos, mejora_calibracion = comparar_modelos_calibracion(evaluado_bt)
-                columna_metrica_principal = (
-                    "Prediccion_calibrada"
-                    if segmento_backtest == "SOLO COMBOS"
-                    else "Prediccion_sin_calibracion"
-                )
                 metricas_bt = calcular_metricas(
-                    evaluado_bt["Actual"], evaluado_bt[columna_metrica_principal]
+                    evaluado_bt["Actual"], evaluado_bt["Prediccion_sin_calibracion"]
                 )
                 m1, m2, m3, m4, m5 = st.columns(5)
                 m1.metric("WAPE", f"{metricas_bt['WAPE']:.2f}%")
@@ -1107,12 +1010,17 @@ if archivos:
                 m5.metric("Sesgo", f"{metricas_bt['SESGO']:+.2f}%")
                 st.caption(
                     f"Venta real: ${metricas_bt['REAL']:,.2f} | "
-                    f"Pronóstico del escenario activo: ${metricas_bt['PRED']:,.2f} | "
+                    f"Pronóstico con piso mensual: ${metricas_bt['PRED']:,.2f} | "
                     f"{evaluado_bt['CODIGO'].nunique():,} SKU"
                 )
 
-                st.markdown("#### Comparación: piso reducido vs piso reducido + calibración combo")
-
+                st.markdown("#### Comparación: antes vs calibración selectiva")
+                if segmento_backtest == "SOLO COMBOS":
+                    st.warning(
+                        "En la configuración actual los combos usan factor 1.00. "
+                        "Por eso las métricas con y sin calibración por categoría deben ser iguales. "
+                        "Esta vista sirve para medir el desempeño base de los combos antes de diseñar una calibración exclusiva."
+                    )
                 formato_comparacion = {
                     "WAPE": "{:.2f}%", "MAE": "${:,.2f}",
                     "RMSE": "${:,.2f}", "R2": "{:.4f}",
@@ -1132,11 +1040,11 @@ if archivos:
                 d4.metric("Δ R²", f"{delta['Cambio_R2']:+.4f}")
                 d5.metric("Δ Sesgo", f"{delta['Cambio_Sesgo_pp']:+.2f} pp")
                 if delta["Cambio_WAPE_pp"] < 0 and delta["Cambio_RMSE"] <= 0:
-                    st.success("La calibración exclusiva de combos mejora WAPE y no empeora RMSE.")
+                    st.success("La calibración selectiva mejora WAPE y no empeora RMSE.")
                 elif delta["Cambio_WAPE_pp"] < 0:
                     st.warning("La calibración mejora WAPE, pero aumenta RMSE. Revisa categorías y SKU extremos.")
                 else:
-                    st.error("La calibración exclusiva de combos no mejora el WAPE. No se recomienda activarla como versión final.")
+                    st.error("La calibración selectiva no mejora el WAPE global. No se recomienda activarla como versión final.")
 
                 por_categoria_comparado = metricas_por_categoria_comparadas(evaluado_bt)
                 st.markdown("#### Efecto por categoría")
@@ -1165,10 +1073,10 @@ if archivos:
                     st.markdown("#### Diagnóstico exclusivo de combos")
                     combo_sku = evaluado_bt.copy()
                     combo_sku["ERROR_ABS"] = (
-                        combo_sku["Actual"] - combo_sku["Prediccion_calibrada"]
+                        combo_sku["Actual"] - combo_sku["Prediccion_sin_calibracion"]
                     ).abs()
                     combo_sku["ERROR_NETO"] = (
-                        combo_sku["Prediccion_calibrada"] - combo_sku["Actual"]
+                        combo_sku["Prediccion_sin_calibracion"] - combo_sku["Actual"]
                     )
                     combo_sku["ERROR_PCT"] = np.where(
                         combo_sku["Actual"].abs() > 0,
@@ -1182,11 +1090,9 @@ if archivos:
                         )
                         .agg(
                             Venta_real=("Actual", "sum"),
-                            Pronostico=("Prediccion_calibrada", "sum"),
+                            Pronostico=("Prediccion_sin_calibracion", "sum"),
                             Error_absoluto=("ERROR_ABS", "sum"),
                             Error_neto=("ERROR_NETO", "sum"),
-                            Factor_combo=("Factor_calibracion_categoria", "max"),
-                            Motivo_calibracion=("Motivo_calibracion", "first"),
                         )
                     )
                     resumen_combo_sku["Sesgo_pct"] = np.where(
@@ -1212,7 +1118,6 @@ if archivos:
                             "Error_neto": "${:+,.2f}",
                             "Sesgo_pct": "{:+.2f}%",
                             "Contribucion_error_pct": "{:.2f}%",
-                            "Factor_combo": "{:.2f}",
                         }),
                         use_container_width=True,
                         hide_index=True,
@@ -1220,7 +1125,7 @@ if archivos:
                     st.download_button(
                         "Descargar diagnóstico exclusivo de combos",
                         resumen_combo_sku.to_csv(index=False).encode("utf-8-sig"),
-                        "diagnostico_calibracion_exclusiva_combos.csv",
+                        "diagnostico_metricas_solo_combos.csv",
                         "text/csv",
                     )
 
