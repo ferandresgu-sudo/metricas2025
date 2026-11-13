@@ -40,7 +40,7 @@ def get_features(usar_macro=False):
     return get_num_features(usar_macro) + CAT_FEATURES
 
 
-# Aliases por compatibilidad (usados en backtest y forecast sin macro).
+# Aliases por compatibilidad (backtest y forecast sin macro).
 NUM_FEATURES = NUM_FEATURES_BASE
 FEATURES = NUM_FEATURES + CAT_FEATURES
 
@@ -75,7 +75,7 @@ RECUPERACION_COMBO_DIC = 0.30
 
 
 # ============================================================
-# Utilidades de carga (sin cambios)
+# Utilidades de normalización y carga
 # ============================================================
 def normalizar_codigo(serie):
     return serie.astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
@@ -259,56 +259,117 @@ def completar_calendario(df):
 
 
 # ============================================================
-# NUEVO: carga y merge de variables macroeconómicas
+# Carga robusta de variables macroeconómicas
 # ============================================================
 def cargar_variables_macro(archivo):
-    """Lee CSV/Excel macro y valida columnas. Devuelve DataFrame limpio o None."""
+    """Lee CSV/Excel macro tolerando BOM, ; vs , y acentos en encabezados."""
     if archivo is None:
         return None
-    try:
+
+    contenido = archivo.getvalue() if hasattr(archivo, "getvalue") else archivo
+    m = None
+    intentos = []
+
+    # 1) Intentar como texto con múltiples encodings y separadores
+    for enc in ["utf-8-sig", "utf-8", "latin-1", "cp1252"]:
+        for sep in [",", ";", "\t"]:
+            try:
+                candidato = pd.read_csv(io.BytesIO(contenido), encoding=enc, sep=sep)
+                if candidato.shape[1] >= 3 and len(candidato) > 0:
+                    m = candidato
+                    intentos.append(f"OK enc={enc} sep='{sep}' cols={list(candidato.columns)}")
+                    break
+            except Exception as e:
+                intentos.append(f"fail enc={enc} sep='{sep}': {e}")
+        if m is not None:
+            break
+
+    # 2) Fallback a Excel si no era CSV
+    if m is None:
         try:
-            m = pd.read_csv(archivo)
-        except Exception:
-            m = pd.read_excel(archivo)
-    except Exception as exc:
-        st.error(f"No fue posible leer el archivo macro: {exc}")
+            m = pd.read_excel(io.BytesIO(contenido))
+            intentos.append("OK como Excel")
+        except Exception as e:
+            intentos.append(f"fail Excel: {e}")
+
+    if m is None:
+        with st.expander("Diagnóstico de lectura macro"):
+            st.code("\n".join(intentos))
+        st.error(
+            "No se pudo leer el archivo macro. Descarga la plantilla desde el botón "
+            "de abajo y edítala sin cambiar los encabezados."
+        )
         return None
-    requeridas = ["AÑO", "MES_NUM"] + MACRO_FEATURES
-    faltantes = [c for c in requeridas if c not in m.columns]
+
+    # 3) Normalizar encabezados (mayúsculas, sin acentos, sin BOM)
+    m.columns = [_normalizar_encabezado(c).replace("\ufeff", "") for c in m.columns]
+
+    # 4) Mapear alias a nombres canónicos
+    alias = {
+        "AÑO": ["AÑO", "ANO", "ANIO", "YEAR", "AÑO_MES"],
+        "MES_NUM": ["MES_NUM", "MES", "MONTH", "NUM_MES"],
+        "ICC_BC": ["ICC_BC", "ICC", "CONFIANZA_CONSUMIDOR", "ICC_BAJA_CALIFORNIA"],
+        "INFLACION_LACTEOS_BC": [
+            "INFLACION_LACTEOS_BC", "INFLACION_LACTEOS",
+            "INFLACION_LACTEOS_BAJA_CALIFORNIA",
+            "INFLACION", "INFLACION_BC",
+        ],
+        "ITAEE_BC": ["ITAEE_BC", "ITAEE", "ACTIVIDAD_ECONOMICA",
+                     "ITAEE_BAJA_CALIFORNIA"],
+    }
+    mapeo = {}
+    for canon, opciones in alias.items():
+        for op in opciones:
+            op_norm = _normalizar_encabezado(op)
+            if op_norm in m.columns:
+                mapeo[op_norm] = canon
+                break
+    m = m.rename(columns=mapeo)
+
+    faltantes = [c for c in ["AÑO", "MES_NUM"] + MACRO_FEATURES if c not in m.columns]
     if faltantes:
-        st.error(f"El CSV macro no tiene las columnas: {faltantes}. "
-                 f"Se esperan: {requeridas}")
+        st.error(
+            f"El archivo macro no tiene las columnas requeridas: {faltantes}.\n\n"
+            f"Columnas detectadas: {list(m.columns)}\n\n"
+            f"Esperado (cualquier alias de): {alias}"
+        )
+        with st.expander("Ver primeras filas leídas"):
+            st.dataframe(m.head(5))
         return None
+
+    # 5) Convertir tipos y limpiar
     m["AÑO"] = pd.to_numeric(m["AÑO"], errors="coerce")
     m["MES_NUM"] = pd.to_numeric(m["MES_NUM"], errors="coerce")
     for var in MACRO_FEATURES:
-        m[var] = pd.to_numeric(m[var], errors="coerce")
+        m[var] = (m[var].astype(str).str.replace(",", ".", regex=False)
+                  .pipe(pd.to_numeric, errors="coerce"))
     m = m.dropna(subset=["AÑO", "MES_NUM"]).copy()
     m["AÑO"] = m["AÑO"].astype(int)
     m["MES_NUM"] = m["MES_NUM"].astype(int)
+    m = m.drop_duplicates(subset=["AÑO", "MES_NUM"], keep="last").sort_values(
+        ["AÑO", "MES_NUM"]).reset_index(drop=True)
+
+    st.success(
+        f"Macro cargada: {len(m)} periodos | "
+        f"{m['AÑO'].min()}-{m['MES_NUM'].min():02d} → "
+        f"{m['AÑO'].max()}-{m['MES_NUM'].max():02d}"
+    )
     return m
 
 
 def merge_macro(df, df_macro):
-    """Une variables macro al dataframe principal. Carry-forward por variable."""
     if df_macro is None or df_macro.empty:
         return df
     out = df.merge(df_macro, on=["AÑO", "MES_NUM"], how="left")
     out = out.sort_values(["AÑO", "MES_NUM"]).reset_index(drop=True)
     for var in MACRO_FEATURES:
         if var in out.columns:
-            out[var] = out.groupby("CODIGO")[var].transform(
-                lambda s: s.ffill().bfill()
-            )
+            out[var] = out.groupby("CODIGO")[var].transform(lambda s: s.ffill().bfill())
             out[var] = out[var].fillna(out[var].median()).fillna(0)
     return out
 
 
 def construir_macro_futuro(df_macro, periodos):
-    """Devuelve dict {(año, mes): {var: valor}} para los periodos futuros.
-
-    Si el periodo no existe en el CSV, usa carry-forward del último valor conocido.
-    """
     if df_macro is None or df_macro.empty:
         return None
     ultimo = df_macro.sort_values(["AÑO", "MES_NUM"]).iloc[-1]
@@ -324,7 +385,7 @@ def construir_macro_futuro(df_macro, periodos):
 
 
 # ============================================================
-# Features y entrenamiento (con soporte macro)
+# Features y entrenamiento
 # ============================================================
 def crear_features(df, objetivo, usar_macro=False):
     z = df.sort_values(["CODIGO", "Periodo"]).copy()
@@ -429,7 +490,7 @@ def predecir_objetivo(modelo, medianas, historial, periodos, objetivo,
 
 
 # ============================================================
-# Estacionalidad y calibración (sin cambios)
+# Estacionalidad y calibración
 # ============================================================
 def indice_estacional(historial, ano_objetivo):
     h = historial[historial["AÑO"] < ano_objetivo]
@@ -477,9 +538,12 @@ def aplicar_ajuste_estacional(pred_base, historial, periodo):
     pred_comb = 0.90 * float(pred_est) + 0.10 * float(ref_suav)
     factor_piso = float(np.clip(1.0 + 0.35 * (crec - 1.0), 0.94, 1.15))
     piso = ultimo_ano * factor_piso
-    if mes == 11: pct = 0.45
-    elif mes == 12: pct = 0.60
-    else: pct = 0.40
+    if mes == 11:
+        pct = 0.45
+    elif mes == 12:
+        pct = 0.60
+    else:
+        pct = 0.40
     if pred_comb < piso:
         corr = pct * (piso - pred_comb)
         pred_final = pred_comb + corr
@@ -562,7 +626,7 @@ def calcular_metricas(y_real, y_pred):
 
 
 # ============================================================
-# Backtest (con soporte macro)
+# Backtest
 # ============================================================
 @st.cache_data(show_spinner=False)
 def backtest_suavizado_nov_dic_2025(df, usar_macro=False, version="v3-macro"):
@@ -678,7 +742,7 @@ def tabla_metricas_por_categoria(detalle, col="Prediccion_final"):
 
 
 # ============================================================
-# Forecast 2026 (con soporte macro)
+# Forecast 2026
 # ============================================================
 @st.cache_data(show_spinner=False)
 def generar_forecast(df, usar_macro=False, version="piso-parcial-macro-v1"):
@@ -738,11 +802,13 @@ def preparar_grafica(df_historico, forecast, categoria, combo, producto, fecha_c
     historico["Fecha"] = pd.to_datetime(dict(year=historico["AÑO"].astype(int),
                                              month=historico["MES_NUM"].astype(int), day=1))
     historico = historico[historico["Fecha"] <= pd.Timestamp(fecha_corte_hist)]
-    historico = historico.rename(columns={"VENTA": "Valor"}); historico["Serie"] = "Venta real"
+    historico = historico.rename(columns={"VENTA": "Valor"})
+    historico["Serie"] = "Venta real"
     previsto = futuro.groupby("Periodo", as_index=False)["Prediccion_final"].sum()
     previsto["Fecha"] = pd.to_datetime(dict(year=(previsto["Periodo"] // 100).astype(int),
                                             month=(previsto["Periodo"] % 100).astype(int), day=1))
-    previsto = previsto.rename(columns={"Prediccion_final": "Valor"}); previsto["Serie"] = "Forecast"
+    previsto = previsto.rename(columns={"Prediccion_final": "Valor"})
+    previsto["Serie"] = "Forecast"
     corte = historico[historico["Fecha"] == pd.Timestamp(fecha_corte_hist)][["Fecha", "Valor"]].copy()
     puente = corte if not corte.empty else historico.sort_values("Fecha").tail(1)[["Fecha", "Valor"]].copy()
     puente["Serie"] = "Forecast"
@@ -761,15 +827,76 @@ archivos = st.file_uploader("Carga los Excel de ventas 2024, 2025 y 2026",
                             type=["xlsx"], accept_multiple_files=True)
 
 st.markdown("### 2) Variables macroeconómicas (opcional)")
-st.caption("Sube un CSV con columnas AÑO, MES_NUM, ICC_BC, INFLACION_LACTEOS_BC, ITAEE_BC. "
-           "Si no lo subes, el modelo corre exactamente como antes (sin macro).")
-macro_archivo = st.file_uploader("CSV macro Baja California", type=["csv", "xlsx"], key="macro_csv")
-usar_macro = st.toggle("Activar variables macroeconómicas en el modelo",
-                       value=False, help="Requiere CSV macro cargado arriba.")
-df_macro = cargar_variables_macro(macro_archivo) if usar_macro else None
-if usar_macro and df_macro is None:
-    st.warning("Toggle activo pero no hay CSV macro válido. Se usará modo sin macro.")
-    usar_macro = False
+st.caption(
+    "Sube un CSV con columnas AÑO, MES_NUM, ICC_BC, INFLACION_LACTEOS_BC, ITAEE_BC. "
+    "Acepta separador `,` o `;`, y encoding UTF-8 o Latin-1."
+)
+
+PLANTILLA_MACRO = """AÑO,MES_NUM,ICC_BC,INFLACION_LACTEOS_BC,ITAEE_BC
+2024,1,45.8,4.5,2.4
+2024,2,46.1,4.6,2.2
+2024,3,46.5,4.8,2.5
+2024,4,46.2,4.9,2.3
+2024,5,45.9,5.0,2.1
+2024,6,45.5,5.1,1.9
+2024,7,45.2,5.2,1.8
+2024,8,44.9,5.3,1.6
+2024,9,44.5,5.4,1.4
+2024,10,44.1,5.5,1.2
+2024,11,44.3,5.6,1.3
+2024,12,44.6,5.7,1.5
+2025,1,44.0,5.9,1.0
+2025,2,43.8,6.0,0.8
+2025,3,43.9,6.1,0.6
+2025,4,43.5,6.2,0.4
+2025,5,43.2,6.3,0.1
+2025,6,43.0,6.2,-0.2
+2025,7,42.9,6.3,-0.5
+2025,8,42.8,6.4,-0.8
+2025,9,42.9,6.4,-1.2
+2025,10,42.7,6.4,-1.5
+2025,11,42.5,6.5,-1.6
+2025,12,43.0,6.6,-1.4
+2026,1,42.4,6.6,-1.7
+2026,2,42.3,6.7,-1.8
+2026,3,42.2,6.8,-1.9
+2026,4,42.1,6.8,-1.9
+2026,5,42.0,6.9,-2.0
+2026,6,42.0,6.9,-2.0
+2026,7,41.9,7.0,-2.1
+2026,8,41.8,7.0,-2.1
+2026,9,41.7,7.1,-2.2
+2026,10,41.6,7.1,-2.2
+2026,11,41.5,7.1,-2.3
+2026,12,41.7,7.2,-2.1
+"""
+
+col_upl, col_dl = st.columns([3, 1])
+with col_dl:
+    st.download_button(
+        "⬇️ Descargar plantilla CSV",
+        PLANTILLA_MACRO.encode("utf-8-sig"),
+        "macro_bc_plantilla.csv",
+        "text/csv",
+        help="Descarga este archivo, edítalo en Excel o bloc de notas, y súbelo abajo.",
+    )
+with col_upl:
+    macro_archivo = st.file_uploader(
+        "CSV macro Baja California", type=["csv", "txt", "xlsx"], key="macro_csv"
+    )
+
+usar_macro = st.toggle(
+    "Activar variables macroeconómicas en el modelo",
+    value=False,
+    help="Requiere CSV macro cargado arriba.",
+)
+
+df_macro = None
+if usar_macro:
+    df_macro = cargar_variables_macro(macro_archivo)
+    if df_macro is None:
+        st.warning("Toggle activo pero no hay CSV macro válido. Se usará modo sin macro.")
+        usar_macro = False
 
 st.markdown("### 3) Modo de ejecución")
 modo = st.radio("Modo",
@@ -796,10 +923,6 @@ if archivos:
             st.stop()
 
         st.info(f"Modo: **{modo}** | Macro: **{'ACTIVA' if usar_macro else 'INACTIVA'}**")
-        if usar_macro and df_macro is not None:
-            periodos_macro = sorted(set(zip(df_macro["AÑO"], df_macro["MES_NUM"])))
-            st.caption(f"CSV macro cubre {len(periodos_macro)} periodos "
-                       f"({periodos_macro[0]} → {periodos_macro[-1]}).")
 
         # ---------- BACKTEST ----------
         if modo_key == "backtest_2025":
@@ -821,9 +944,12 @@ if archivos:
 
             if "bt_sin" in st.session_state:
                 def filtrar_seg(d):
-                    if d is None or d.empty: return pd.DataFrame()
-                    if segmento == "SOLO COMBOS": return d[d["COMBOS"] == 1].copy()
-                    if segmento == "SIN COMBOS": return d[d["COMBOS"] == 0].copy()
+                    if d is None or d.empty:
+                        return pd.DataFrame()
+                    if segmento == "SOLO COMBOS":
+                        return d[d["COMBOS"] == 1].copy()
+                    if segmento == "SIN COMBOS":
+                        return d[d["COMBOS"] == 0].copy()
                     return d.copy()
 
                 sin = filtrar_seg(st.session_state["bt_sin"])
@@ -850,12 +976,9 @@ if archivos:
                         d = comp.iloc[1]
                         b = comp.iloc[0]
                         d1, d2, d3, d4, d5 = st.columns(5)
-                        d1.metric("Δ WAPE", f"{d['WAPE']-b['WAPE']:+.2f} pp",
-                                  delta_color="inverse")
-                        d2.metric("Δ MAE", f"${d['MAE']-b['MAE']:+,.0f}",
-                                  delta_color="inverse")
-                        d3.metric("Δ RMSE", f"${d['RMSE']-b['RMSE']:+,.0f}",
-                                  delta_color="inverse")
+                        d1.metric("Δ WAPE", f"{d['WAPE']-b['WAPE']:+.2f} pp")
+                        d2.metric("Δ MAE", f"${d['MAE']-b['MAE']:+,.0f}")
+                        d3.metric("Δ RMSE", f"${d['RMSE']-b['RMSE']:+,.0f}")
                         d4.metric("Δ R²", f"{d['R2']-b['R2']:+.4f}")
                         d5.metric("Δ Sesgo", f"{d['SESGO']-b['SESGO']:+.2f} pp")
 
@@ -876,16 +999,13 @@ if archivos:
                         else:
                             st.error("El macro no mejora el WAPE. No se recomienda activarlo.")
 
-                    # Detalle por categoría (foco en lácteos culinarios)
                     st.markdown("#### Detalle por categoría")
                     if not con.empty:
                         cat_sin = tabla_metricas_por_categoria(sin, "Prediccion_calibrada")
                         cat_con = tabla_metricas_por_categoria(con, "Prediccion_calibrada")
-                        comp_cat = cat_sin.merge(cat_con, on="CATEGORIA", suffixes=("_sin", "_con"), how="outer")
-                        st.dataframe(comp_cat.style.format({
-                            c: "{:.2f}" for c in comp_cat.columns
-                            if any(k in c for k in ["WAPE", "SESGO"]) and c != "CATEGORIA"
-                        }), use_container_width=True, hide_index=True)
+                        comp_cat = cat_sin.merge(cat_con, on="CATEGORIA",
+                                                 suffixes=("_sin", "_con"), how="outer")
+                        st.dataframe(comp_cat, use_container_width=True, hide_index=True)
 
                     with st.expander("Detalle SKU (sin macro)"):
                         st.dataframe(sin, use_container_width=True, hide_index=True)
@@ -912,10 +1032,12 @@ if archivos:
                 with c1:
                     cat = st.selectbox("Categoría", categorias)
                 with c2:
-                    combo = st.segmented_control("Tipo", ["TODOS", "SIN COMBOS", "COMBOS"],
+                    combo = st.segmented_control("Tipo",
+                                                 ["TODOS", "SIN COMBOS", "COMBOS"],
                                                  default="SIN COMBOS") or "SIN COMBOS"
                 universo = forecast.copy()
-                if cat != "TODAS": universo = universo[universo["CATEGORIA"] == cat]
+                if cat != "TODAS":
+                    universo = universo[universo["CATEGORIA"] == cat]
                 if combo != "TODOS":
                     universo = universo[universo["COMBOS"] == (1 if combo == "COMBOS" else 0)]
                 prods = universo[["CODIGO", "DESCRIPCION"]].drop_duplicates()
@@ -935,10 +1057,12 @@ if archivos:
                 cr_dic = (dic / nov - 1) * 100 if nov > 0 else np.nan
                 k1, k2, k3, k4 = st.columns(4)
                 k1.metric("Octubre 2026 real", f"${oct_real:,.0f}")
-                k2.metric("Noviembre 2026", f"${nov:,.0f}", f"{cr_nov:+.1f}% vs octubre" if pd.notna(cr_nov) else None)
-                k3.metric("Diciembre 2026", f"${dic:,.0f}", f"{cr_dic:+.1f}% vs noviembre" if pd.notna(cr_dic) else None)
+                k2.metric("Noviembre 2026", f"${nov:,.0f}",
+                          f"{cr_nov:+.1f}% vs octubre" if pd.notna(cr_nov) else None)
+                k3.metric("Diciembre 2026", f"${dic:,.0f}",
+                          f"{cr_dic:+.1f}% vs noviembre" if pd.notna(cr_dic) else None)
                 k4.metric("SKU incluidos", f"{universo['CODIGO'].nunique():,}")
-                # Gráfica
+
                 eje_x = alt.X("Fecha:T", title=None,
                               scale=alt.Scale(domain=[pd.Timestamp("2024-01-01"),
                                                       pd.Timestamp("2026-12-01")]),
@@ -952,7 +1076,7 @@ if archivos:
                 chart = alt.layer(
                     alt.Chart(h).mark_line(color="#3B82F6", strokeWidth=3).encode(x=eje_x, y=eje_y, tooltip=tt),
                     alt.Chart(h).mark_circle(color="#3B82F6", size=44).encode(x=eje_x, y=eje_y, tooltip=tt),
-                    alt.Chart(fl).mark_line(color="#F59E0B", strokeWidth=3.5, strokeDash=[8,5]).encode(x=eje_x, y=eje_y, tooltip=tt),
+                    alt.Chart(fl).mark_line(color="#F59E0B", strokeWidth=3.5, strokeDash=[8, 5]).encode(x=eje_x, y=eje_y, tooltip=tt),
                     alt.Chart(fp).mark_circle(color="#F59E0B", size=125, stroke="white", strokeWidth=1.5).encode(x=eje_x, y=eje_y, tooltip=tt),
                 ).properties(height=500, title="Forecast Nov-Dic 2026")
                 st.altair_chart(chart, use_container_width=True)
